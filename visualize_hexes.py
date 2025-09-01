@@ -7,6 +7,8 @@ from matplotlib.colors import to_hex
 from matplotlib.patches import Patch
 from hxf_io import read_hxf
 
+FILENAME = "south america_series_assignment"
+
 def generate_distinct_colors(n: int, cmap_name: str = "tab20") -> list[str]:
     if n <= 0:
         return []
@@ -116,4 +118,4 @@ def visualize_hxf(
 
 
 if __name__ == "__main__":
-    visualize_hxf(Path("outputs/south america_series_assignment.hxf"))
+    visualize_hxf(Path(f"outputs/{FILENAME}.hxf"))
