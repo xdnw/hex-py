@@ -1,24 +1,29 @@
 from __future__ import annotations
 
+import time
 import math
 import random
-from collections import deque, defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Set
 
 import numpy as np
+from heapq import heappush, heappop
 
 from hxf_io import read_hxf, write_hxf, ORIENT_POINTY
 
 # -----------------------------
-# User-configurable mock input
+# User-configurable input
 # -----------------------------
-HXF_PATH = Path("outputs/world_hexes_equal_earth.hxf")
-CONTINENT = "south america"  # lower/upper will be normalized
+HXF_PATH = Path('outputs/world_hexes_equal_earth.hxf')
+CONTINENT = "south america"  # case-insensitive
 OUTPUT_HXF = Path(f"outputs/{CONTINENT.lower()}_series_assignment.hxf")
 RANDOM_SEED = 42
+MAX_STALL_LOOPS = 50
 DEBUG = True
+BLOBINESS = 1
 
+# Target global distribution (weights, not necessarily integers)
 DISTRIBUTION = {
     "Eclipse": 13.2,
     "The Syndicate": 12.5,
@@ -35,11 +40,15 @@ DISTRIBUTION = {
     "The Immortals": 1.4,
 }
 
+# Physics growth parameters
+SEED_JITTER = 1e-6  # small jitter for tie-breaking
+PRESSURE_EPS = 1e-9  # numerical stability
+
+
 # -----------------------------
-# Helpers: apportionment
+# Apportionment helpers
 # -----------------------------
 def largest_remainder_apportion(weights: Dict[str, float], total: int) -> Dict[str, int]:
-    """Hamilton method to convert weights to integers summing to total."""
     keys = list(weights.keys())
     w = np.array([max(0.0, float(weights[k])) for k in keys], dtype=np.float64)
     if w.sum() <= 0:
@@ -61,14 +70,12 @@ def largest_remainder_apportion(weights: Dict[str, float], total: int) -> Dict[s
 def split_counts_across_components(
     global_counts: Dict[str, int], comp_sizes: List[int]
 ) -> List[Dict[str, int]]:
-    """Split per-series totals across components proportional to component size."""
     comps = len(comp_sizes)
     total_tiles = int(sum(comp_sizes))
     if total_tiles == 0 or comps == 0:
         return [{} for _ in range(comps)]
 
     per_comp_counts = [dict((k, 0) for k in global_counts.keys()) for _ in range(comps)]
-
     for series, g_count in global_counts.items():
         if g_count <= 0:
             continue
@@ -110,7 +117,7 @@ def split_counts_across_components(
 
 
 # -----------------------------
-# Helpers: adjacency on hex grid
+# Hex adjacency and components
 # -----------------------------
 def build_neighbor_graph(
     indices: np.ndarray,
@@ -120,15 +127,7 @@ def build_neighbor_graph(
     tol_factor: float = 1e-3,
     debug: bool = False,
 ) -> Dict[int, List[int]]:
-    """
-    Adjacency among 'indices' using hex neighbor offsets.
-    Uses a tolerance-based hash to be robust to floating noise.
-
-    tol_factor: rounding tolerance as a fraction of radius (default 1e-3).
-    """
-    # Geometry by orientation
     if int(orientation) == int(ORIENT_POINTY):
-        # pointy-top
         dx = math.sqrt(3.0) * radius
         dy = 1.5 * radius
         offsets = [
@@ -140,7 +139,6 @@ def build_neighbor_graph(
             (-dx / 2.0, -dy),
         ]
     else:
-        # flat-top
         dy = math.sqrt(3.0) * radius
         dx = 1.5 * radius
         offsets = [
@@ -152,17 +150,14 @@ def build_neighbor_graph(
             (-dx, -dy / 2.0),
         ]
 
-    # Tolerance grid
     tol = max(1e-9, float(radius) * float(tol_factor))
 
     def key_xy(x: float, y: float) -> Tuple[int, int]:
-        # Quantize by tol to absorb small numeric discrepancies
         return (int(round(x / tol)), int(round(y / tol)))
 
     sub_idx = np.asarray(indices, dtype=np.int64)
     sub_centers = centers[sub_idx]
     lookup = {key_xy(float(x), float(y)): int(gidx) for gidx, (x, y) in zip(sub_idx, sub_centers)}
-
     adj: Dict[int, List[int]] = {int(i): [] for i in sub_idx}
     missing = 0
     for gidx, (x, y) in zip(sub_idx, sub_centers):
@@ -174,20 +169,13 @@ def build_neighbor_graph(
                 adj[int(gidx)].append(nb)
             else:
                 missing += 1
-
     if debug:
         degs = np.array([len(adj[i]) for i in sub_idx], dtype=int)
         print(f"[adj] nodes={len(sub_idx)} mean_deg={degs.mean():.2f} min={degs.min()} max={degs.max()} missing_lookups={missing}")
-        # Spot-check some nodes
-        sample = sub_idx[: min(10, len(sub_idx))]
-        for i in sample:
-            print(f"[adj] idx={int(i)} deg={len(adj[int(i)])}")
-
     return adj
 
 
 def connected_components(nodes: List[int], adj: Dict[int, List[int]]) -> List[List[int]]:
-    """Connected components among given nodes via adjacency."""
     node_set = set(nodes)
     seen = set()
     comps: List[List[int]] = []
@@ -209,367 +197,354 @@ def connected_components(nodes: List[int], adj: Dict[int, List[int]]) -> List[Li
 
 
 # -----------------------------
-# Region growing per component
+# Seeding
 # -----------------------------
-def farthest_point_seeds(comp_indices: List[int], centers: np.ndarray, k: int, rng: random.Random) -> List[int]:
-    """Pick k seeds via farthest-point sampling."""
-    if k <= 0:
+def farthest_point_seeds(
+    comp_indices: List[int],
+    centers: np.ndarray,
+    k: int,
+    rng: random.Random,
+) -> List[int]:
+    if k <= 0 or not comp_indices:
         return []
+    idx = np.asarray(comp_indices, dtype=np.int64)
+    P = centers[idx].astype(np.float64)
+    centroid = P.mean(axis=0)
+    d2_centroid = np.sum((P - centroid) ** 2, axis=1)
+    # Pick farthest-from-centroid (periphery) as the first seed to avoid being boxed in
+    first_local = int(np.argmax(d2_centroid))
+    seeds = [int(idx[first_local])]
     if k == 1:
-        return [rng.choice(comp_indices)]
-    pts = centers[comp_indices]
-    seeds = [rng.choice(comp_indices)]
-    seeds_pts = [centers[seeds[0]]]
+        return seeds
+    d2min = np.sum((P - centers[seeds[0]]) ** 2, axis=1)
     for _ in range(1, k):
-        d2min = []
-        for i, p in zip(comp_indices, pts):
-            d2 = min(((p[0] - sp[0]) ** 2 + (p[1] - sp[1]) ** 2) for sp in seeds_pts)
-            d2min.append((d2, i))
-        _, far_idx = max(d2min, key=lambda t: t[0])
-        seeds.append(int(far_idx))
-        seeds_pts.append(centers[far_idx])
+        next_local = int(np.argmax(d2min + rng.random() * 1e-9))
+        next_seed = int(idx[next_local])
+        seeds.append(next_seed)
+        d2_new = np.sum((P - centers[next_seed]) ** 2, axis=1)
+        d2min = np.minimum(d2min, d2_new)
     return seeds
 
 
-def region_grow_component(
+def physics_growth_assign(
     comp_indices: List[int],
     adj: Dict[int, List[int]],
-    series_names: List[str],
-    local_counts: Dict[str, int],
     centers: np.ndarray,
+    local_counts: Dict[str, int],
     rng: random.Random,
-    debug: bool = False,
 ) -> Dict[int, str]:
-    """
-    Support-weighted multi-source growth with:
-    - Majority-wins guard: if another series has strictly higher support for a tile and has budget,
-      do not claim it. This fills holes and prevents single-hex enclaves.
-    - Batched high-support claims with randomized series order to avoid striping.
-    - Connectivity-preserving completion: redistribute leftover budgets from stuck series to those
-      with frontier; finally assign remaining tiles by max-support while borrowing budget from
-      stuck series. No nearest-seed non-adjacent fallback (prevents disconnected islands).
-    """
-    # Active series and budgets
-    active = [(s, int(c)) for s, c in local_counts.items() if c > 0]
-    if not active:
+    # Series that need tiles (keep original order to minimize behavior changes)
+    series_names = [s for s, c in local_counts.items() if c > 0]
+    if not series_names:
         return {}
-    series_order = [s for s, _ in active]
-    budgets = {s: c for s, c in active}
-    k = len(series_order)
 
-    # Tunables
-    SAMPLE_K = 12          # candidates sampled from a bucket for scoring
-    MAX_CLAIMS_HI = 4      # per-turn consecutive claims when support >= 2
-    JITTER = 1e-6          # tiny tie-breaker
-    RELAXED_GAP = 1        # on relaxed round, allow sup == max_sup - RELAXED_GAP
+    # Local indexing for this component
+    gl_idx = np.asarray(comp_indices, dtype=np.int64)
+    n = int(gl_idx.size)
+    loc_of = {int(g): i for i, g in enumerate(gl_idx)}
 
-    # Seeds via farthest-point sampling
-    seed_candidates = farthest_point_seeds(comp_indices, centers, k, rng)
-    seeds_by_series = {s: seed_candidates[i] for i, s in enumerate(series_order)}
+    # Local adjacency list (neighbors indexed 0..n-1)
+    neighbors: List[List[int]] = []
+    for g in gl_idx:
+        lst = adj.get(int(g), [])
+        neighbors.append([loc_of[v] for v in lst if v in loc_of])
 
-    assigned: Dict[int, str] = {}
-    for s in series_order:
-        v = seeds_by_series[s]
-        assigned[v] = s
-        budgets[s] -= 1
+    S = len(series_names)
+    sid_of = {name: i for i, name in enumerate(series_names)}
+    remain = np.array([int(local_counts[s]) for s in series_names], dtype=np.int32)
+    size_by = np.zeros(S, dtype=np.int32)
 
-    if debug:
-        print("[grow] seeds:")
-        for s in series_order:
-            v = seeds_by_series[s]
-            cx, cy = centers[v]
-            print(f"  {s}: idx={v} at ({float(cx):.3f}, {float(cy):.3f}) budget={budgets[s]}")
+    # Assigned series id per tile (-1 unassigned)
+    assigned = np.full(n, -1, dtype=np.int16)
 
-    comp_set = set(comp_indices)
+    # Seeds: farthest-point, map outermost to largest series (as in original)
+    seeds_gl = farthest_point_seeds(comp_indices, centers, S, rng)
+    seeds_loc = [loc_of[int(g)] for g in seeds_gl]
 
-    # Per-series candidate buckets by support (0..6) and live support counts
-    candidate_buckets: Dict[str, List[set]] = {s: [set() for _ in range(7)] for s in series_order}
-    support_counts: Dict[str, defaultdict] = {s: defaultdict(int) for s in series_order}
+    centroid = centers[gl_idx].astype(np.float64).mean(axis=0)
 
-    # Initialize candidates from seeds
-    for s in series_order:
-        v = seeds_by_series[s]
-        for nb in adj.get(v, []):
-            if nb in comp_set and nb not in assigned:
-                sc = support_counts[s][nb] + 1
-                support_counts[s][nb] = sc
-                candidate_buckets[s][sc].add(nb)
+    def d2_to_centroid_local(li: int) -> float:
+        v = centers[int(gl_idx[li])].astype(np.float64) - centroid
+        return float(v[0] * v[0] + v[1] * v[1])
 
-    def rebucket_if_drifted(s: str, nb: int, expected_sup: int) -> int | None:
-        """Ensure nb is in the bucket matching its current support for series s."""
-        live = support_counts[s].get(nb, 0)
-        if live != expected_sup:
-            if 0 <= expected_sup <= 6:
-                candidate_buckets[s][expected_sup].discard(nb)
-            if 0 <= live <= 6:
-                candidate_buckets[s][live].add(nb)
-            return None
-        return live
+    seeds_sorted_loc = sorted(seeds_loc, key=d2_to_centroid_local, reverse=True)
+    series_sorted = sorted(series_names, key=lambda s: local_counts[s], reverse=True)
 
-    def global_max_support(nb: int) -> tuple[int, str]:
-        """Max support across all series for tile nb."""
-        best_sup, best_s = -1, None
-        for s in series_order:
-            sup = support_counts[s].get(nb, 0)
-            if sup > best_sup:
-                best_sup, best_s = sup, s
-        return best_sup, best_s  # (support, series)
+    seeds_by_sid = [-1] * S
+    for seed, s in zip(seeds_sorted_loc, series_sorted):
+        seeds_by_sid[sid_of[s]] = int(seed)
 
-    def can_claim(s: str, nb: int, sup: int, relaxed: bool) -> bool:
-        """Majority-wins guard with optional relaxation."""
-        max_sup, max_s = global_max_support(nb)
-        if max_s is None:
+    # Per-series region tiles (for fast boundary building during rescue)
+    region_tiles: List[Set[int]] = [set() for _ in range(S)]
+
+    # Initialize seeds
+    for sid in range(S):
+        u = seeds_by_sid[sid]
+        if assigned[u] == -1:
+            assigned[u] = sid
+            remain[sid] -= 1
+            size_by[sid] += 1
+            region_tiles[sid].add(u)
+
+    # Per-series frontier heap: (priority:int, tie:int, u:int)
+    frontiers: List[List[Tuple[int, int, int]]] = [[] for _ in range(S)]
+    # Frontier membership mask (S x n)
+    frontier_mask: List[bytearray] = [bytearray(n) for _ in range(S)]
+    # Cheap per-series tiebreaker counter (faster than rng.random in tight loop)
+    push_counter = [0] * S
+    inv_blob = 1.0 / BLOBINESS if BLOBINESS != 0 else 1.0  # safe
+
+    def nb_same_neighbors(u: int, sid: int) -> int:
+        cnt = 0
+        for v in neighbors[u]:
+            if assigned[v] == sid:
+                cnt += 1
+        return cnt
+
+    def push_frontier_for(sid: int, u: int):
+        if assigned[u] != -1:
+            return
+        fm = frontier_mask[sid]
+        if fm[u]:
+            return
+        b = nb_same_neighbors(u, sid)
+        if b < 0:
+            b = 0
+        elif b > 6:
+            b = 6
+        # Priority: -b (prefer more same-labeled neighbors), tie by monotonic counter
+        cnt = push_counter[sid]
+        push_counter[sid] = cnt + 1
+        heappush(frontiers[sid], (-b, cnt, u))
+        fm[u] = 1
+
+    def rebuild_frontier_for(sid: int):
+        frontier_mask[sid] = bytearray(n)
+        heap = frontiers[sid]
+        heap.clear()
+        # Add all unassigned neighbors of current region
+        for u in region_tiles[sid]:
+            for v in neighbors[u]:
+                if assigned[v] == -1:
+                    push_frontier_for(sid, v)
+
+    # Seed frontiers from seed neighbors
+    for sid in range(S):
+        u = seeds_by_sid[sid]
+        for v in neighbors[u]:
+            if assigned[v] == -1:
+                push_frontier_for(sid, v)
+
+    def expand_one(sid: int) -> Optional[int]:
+        heap = frontiers[sid]
+        fm = frontier_mask[sid]
+        while heap:
+            _, _, u = heappop(heap)
+            # Skip stale entries
+            if assigned[u] != -1:
+                continue
+            # Claim tile
+            assigned[u] = sid
+            fm[u] = 0  # clean mask for this sid
+            remain[sid] -= 1
+            size_by[sid] += 1
+            region_tiles[sid].add(u)
+            # Offer neighbors
+            for w in neighbors[u]:
+                if assigned[w] == -1:
+                    push_frontier_for(sid, w)
+            return u
+        return None
+
+    def is_peelable(u: int, sid: int) -> bool:
+        # A tile is peelable if it has <=1 same-labeled neighbors
+        return nb_same_neighbors(u, sid) <= 1
+
+    def connected_after_removal_fast(u: int, sid: int) -> bool:
+        if size_by[sid] <= 1:
             return True
-        # If someone else has strictly higher support and still has budget, we should not claim.
-        if s != max_s and sup < max_sup and budgets.get(max_s, 0) > 0:
-            # In relaxed mode allow small gap (e.g., sup == max_sup - 1) for high-support tiles only.
-            if relaxed and sup >= max(2, max_sup - RELAXED_GAP):
-                return True
-            return False
-        return True
+        # Find any neighbor with same label
+        start = -1
+        for v in neighbors[u]:
+            if assigned[v] == sid:
+                start = v
+                break
+        if start < 0:
+            return True
+        target = size_by[sid] - 1
+        seen = bytearray(n)
+        seen[u] = 1
+        seen[start] = 1
+        dq = deque([start])
+        count = 1
+        while dq:
+            x = dq.popleft()
+            for y in neighbors[x]:
+                if seen[y] or assigned[y] != sid:
+                    continue
+                seen[y] = 1
+                dq.append(y)
+                count += 1
+                if count >= target:
+                    return True
+        return False
 
-    def score_candidates(s: str, sup: int, sample: List[int]) -> tuple[int | None, int | None, float]:
-        """Score candidates in a bucket and pick best."""
-        best_nb, best_sup, best_score = None, None, -1.0
-        for nb in sample:
-            if nb in assigned:
-                continue
-            live = rebucket_if_drifted(s, nb, sup)
-            if live is None:
-                continue
-            # Cohesion bonus: sum of supports of nb's unassigned neighbors for this series
-            bonus = 0
-            for w in adj.get(nb, []):
-                if w in comp_set and w not in assigned:
-                    bonus += support_counts[s].get(w, 0)
-            score = live + 0.1 * bonus + rng.random() * JITTER
-            if score > best_score:
-                best_nb, best_sup, best_score = nb, live, score
-        if best_nb is not None:
-            candidate_buckets[s][best_sup].discard(best_nb)
-        return best_nb, best_sup, best_score
+    # Progress diagnostics
+    total_target = int(sum(local_counts.values()))
+    start_ts = time.time()
+    last_log_ts = start_ts
+    MAX_BOUNDARY_SAMPLE = 8000
+    MAX_CONNECTIVITY_CHECKS = 1000
+    stall_loops = 0
+    prev_remaining_total = int(remain.sum())
 
-    def pick_best(s: str, min_sup: int, relaxed: bool) -> Tuple[int | None, int | None, float]:
-        """
-        Pick the best candidate for series s with support >= min_sup,
-        respecting majority-wins guard (with optional relaxed mode).
-        """
-        for sup in range(6, min_sup - 1, -1):
-            bucket = candidate_buckets[s][sup]
-            if not bucket:
-                continue
-            # Random sample to avoid scanning large sets
-            if len(bucket) <= SAMPLE_K:
-                sample = list(bucket)
-            else:
-                # Reservoir-like sampling indices from a set
-                idxs = set(rng.sample(range(len(bucket)), SAMPLE_K))
-                sample = []
-                for i, v in enumerate(bucket):
-                    if i in idxs:
-                        sample.append(v)
-                        if len(sample) == SAMPLE_K:
-                            break
-            nb, live_sup, score = score_candidates(s, sup, sample)
-            if nb is None:
-                continue
-            # Majority guard
-            if not can_claim(s, nb, live_sup, relaxed=relaxed):
-                continue
-            return nb, live_sup, score
-        return None, None, 0.0
-
-    def series_frontier_size(s: str) -> int:
-        return sum(len(bucket) for bucket in candidate_buckets[s])
-
-    def redistribute_leftovers():
-        """Move leftover budgets from stuck series (no frontier) to those with frontier."""
-        stuck = [s for s in series_order if budgets[s] > 0 and series_frontier_size(s) == 0]
-        if not stuck:
-            return False
-        give = sum(budgets[s] for s in stuck)
-        if give <= 0:
-            return False
-        for s in stuck:
-            if debug:
-                print(f"[rebalance] {s} stuck; releasing {budgets[s]} tiles")
-            budgets[s] = 0
-        receivers = [s for s in series_order if series_frontier_size(s) > 0]
-        if not receivers:
-            return False
-        # Allocate by frontier size (larger frontiers get more)
-        weights = {s: float(series_frontier_size(s)) for s in receivers}
-        total_w = sum(weights.values())
-        if total_w <= 0:
-            # fallback: equal split
-            share = give // len(receivers)
-            rem = give - share * len(receivers)
-            for s in receivers:
-                budgets[s] += share
-            for s in receivers[:rem]:
-                budgets[s] += 1
-        else:
-            # Largest remainder apportionment
-            ideals = {s: weights[s] / total_w * give for s in receivers}
-            base = {s: int(math.floor(ideals[s])) for s in receivers}
-            rems = sorted(receivers, key=lambda t: ideals[t] - base[t], reverse=True)
-            used = sum(base.values())
-            for s in receivers:
-                budgets[s] += base[s]
-            for s in rems[: give - used]:
-                budgets[s] += 1
-        if debug:
-            dist = ", ".join(f"{s}:{budgets[s]}" for s in series_order)
-            print(f"[rebalance] new budgets -> {dist}")
-        return True
+    def log_progress(force: bool = False, note: str = ""):
+        nonlocal last_log_ts
+        if not DEBUG:
+            return
+        now = time.time()
+        if not force and (now - last_log_ts) < 5.0:  # log less often for speed
+            return
+        remaining_total = int(remain.sum())
+        zero_frontiers = sum(1 for sid in range(S) if remain[sid] > 0 and len(frontiers[sid]) == 0)
+        pct = 100.0 * (int((assigned != -1).sum()) / max(1, total_target))
+        msg = f"[grow] {int((assigned != -1).sum())}/{total_target} ({pct:.1f}%) remain={remaining_total} zero_frontiers={zero_frontiers} elapsed={now - start_ts:.1f}s"
+        if note:
+            msg += f" | {note}"
+        print(msg)
+        tail = sorted([(series_names[sid], int(remain[sid]), len(frontiers[sid])) for sid in range(S)],
+                      key=lambda x: x[1], reverse=True)[:5]
+        print("[grow] top remain:", ", ".join(f"{s}:{r}/F{f}" for s, r, f in tail))
+        last_log_ts = now
 
     # Main growth loop
-    iter_no = 0
-    while any(budgets[s] > 0 for s in series_order):
-        iter_no += 1
-        progressed = False
-        if debug:
-            bud_str = ", ".join(f"{s}:{budgets[s]}" for s in series_order)
-            print(f"[grow] iter={iter_no} budgets: {bud_str}")
+    while True:
+        total_remaining = int(remain.sum())
+        if total_remaining <= 0:
+            break
 
-        order = series_order[:]
-        rng.shuffle(order)
-
-        # Strict round first (majority must win)
-        for s in order:
-            if budgets[s] <= 0:
+        # Choose by pressure
+        best_sid = -1
+        best_pressure = -1.0
+        for sid in range(S):
+            r = int(remain[sid])
+            if r <= 0:
                 continue
-            # Batched high-support claims
-            claims = 0
-            while budgets[s] > 0 and claims < MAX_CLAIMS_HI:
-                nb, sup, score = pick_best(s, min_sup=2, relaxed=False)
-                if nb is None:
-                    break
-                assigned[nb] = s
-                budgets[s] -= 1
-                progressed = True
-                claims += 1
-                if debug:
-                    cx, cy = centers[nb]
-                    print(f"    -> {s} claims idx={nb} sup={sup} score={score:.3f} at ({float(cx):.3f}, {float(cy):.3f}) rem={budgets[s]}")
-                # Update supports for this series
-                for w in adj.get(nb, []):
-                    if w not in comp_set or w in assigned:
-                        continue
-                    old = support_counts[s].get(w, 0)
-                    new = old + 1
-                    support_counts[s][w] = new
-                    if 0 <= old <= 6:
-                        candidate_buckets[s][old].discard(w)
-                    if 0 <= new <= 6:
-                        candidate_buckets[s][new].add(w)
+            fsize = len(frontiers[sid])  # lazy-stale, matches original semantics
+            if fsize == 0:
+                continue
+            if BLOBINESS == 1:
+                denom = float(size_by[sid]) if size_by[sid] > 0 else PRESSURE_EPS
+            else:
+                denom = (size_by[sid] ** inv_blob) if size_by[sid] > 0 else PRESSURE_EPS
+            pressure = (float(r) / float(fsize) + PRESSURE_EPS) / denom
+            # very small jitter (deterministic) to break ties cheaply
+            pressure += (push_counter[sid] & 0xFFFF) * 1e-12
+            if pressure > best_pressure:
+                best_pressure = pressure
+                best_sid = sid
 
-            # Try at most one low-support claim (must still meet majority/tie)
-            if budgets[s] > 0:
-                nb, sup, score = pick_best(s, min_sup=0, relaxed=False)
-                if nb is not None and sup is not None and sup <= 1:
-                    assigned[nb] = s
-                    budgets[s] -= 1
-                    progressed = True
-                    if debug:
-                        cx, cy = centers[nb]
-                        print(f"    -> {s} low-support idx={nb} sup={sup} score={score:.3f} at ({float(cx):.3f}, {float(cy):.3f}) rem={budgets[s]}")
-                    for w in adj.get(nb, []):
-                        if w not in comp_set or w in assigned:
+        progressed_assign = False
+
+        if best_sid >= 0:
+            u = expand_one(best_sid)
+            if u is None:
+                rebuild_frontier_for(best_sid)
+                u = expand_one(best_sid)
+            if u is not None:
+                progressed_assign = True
+        else:
+            # Rescue: peel from neighbors to unblock zero-frontier series
+            rescued = False
+            order = sorted(range(S), key=lambda sid: int(remain[sid]), reverse=True)
+            for sid in order:
+                if remain[sid] <= 0:
+                    continue
+                # Build boundary list of this sid (iterate only its region tiles)
+                boundary_all: List[int] = []
+                for u in region_tiles[sid]:
+                    for v in neighbors[u]:
+                        if assigned[v] != sid:
+                            boundary_all.append(u)
+                            break
+                if not boundary_all:
+                    continue
+                # Sample boundary if too large
+                if len(boundary_all) > MAX_BOUNDARY_SAMPLE:
+                    boundary = rng.sample(boundary_all, MAX_BOUNDARY_SAMPLE)
+                else:
+                    boundary = boundary_all
+                    rng.shuffle(boundary)
+
+                conn_checks = 0
+                for u in boundary:
+                    for v in neighbors[u]:
+                        lab_v = int(assigned[v])
+                        if lab_v < 0 or lab_v == sid:
                             continue
-                        old = support_counts[s].get(w, 0)
-                        new = old + 1
-                        support_counts[s][w] = new
-                        if 0 <= old <= 6:
-                            candidate_buckets[s][old].discard(w)
-                        if 0 <= new <= 6:
-                            candidate_buckets[s][new].add(w)
-
-        # If nothing happened, run a relaxed round to break stalemates (still avoids blatant minority grabs)
-        if not progressed and any(budgets[s] > 0 for s in series_order):
-            for s in order:
-                if budgets[s] <= 0:
-                    continue
-                nb, sup, score = pick_best(s, min_sup=2, relaxed=True)
-                if nb is None:
-                    continue
-                assigned[nb] = s
-                budgets[s] -= 1
-                progressed = True
-                if debug:
-                    cx, cy = centers[nb]
-                    print(f"    -> {s} relaxed idx={nb} sup={sup} score={score:.3f} at ({float(cx):.3f}, {float(cy):.3f}) rem={budgets[s]}")
-                for w in adj.get(nb, []):
-                    if w not in comp_set or w in assigned:
-                        continue
-                    old = support_counts[s].get(w, 0)
-                    new = old + 1
-                    support_counts[s][w] = new
-                    if 0 <= old <= 6:
-                        candidate_buckets[s][old].discard(w)
-                    if 0 <= new <= 6:
-                        candidate_buckets[s][new].add(w)
-
-        # If still no progress, try budget redistribution from stuck to frontier-rich series
-        if not progressed and any(budgets[s] > 0 for s in series_order):
-            changed = redistribute_leftovers()
-            if not changed:
-                # Nothing to do; break to completion step
-                break
-
-    # Connectivity-preserving completion:
-    # Fill any remaining tiles by assigning to the series with max SUPPORT for that tile,
-    # borrowing budget from stuck series if needed (keeps per-component totals exact).
-    remaining = [i for i in comp_indices if i not in assigned]
-    if remaining and debug:
-        print(f"[finalize] remaining tiles to assign: {len(remaining)}")
-
-    if remaining:
-        # Precompute stuck list (those who still hold budget but have no frontier)
-        def refresh_stuck():
-            return [s for s in series_order if budgets[s] > 0 and series_frontier_size(s) == 0]
-
-        for idx in remaining:
-            # Choose series with maximum support for this tile
-            best_sup, best_s = -1, None
-            for s in series_order:
-                sup = support_counts[s].get(idx, 0)
-                if sup > best_sup:
-                    best_sup, best_s = sup, s
-            if best_s is None:
-                # Fallback: pick any series with budget (should be rare)
-                best_s = max(series_order, key=lambda s: budgets.get(s, 0))
-            # Ensure we have budget: borrow from stuck if needed
-            if budgets.get(best_s, 0) <= 0:
-                donors = refresh_stuck()
-                # If no stuck donors, borrow from the series with largest remaining budget
-                if not donors:
-                    donors = sorted(series_order, key=lambda s: budgets.get(s, 0), reverse=True)
-                for d in donors:
-                    if budgets.get(d, 0) > 0:
-                        budgets[d] -= 1
-                        budgets[best_s] = budgets.get(best_s, 0) + 1
-                        if debug:
-                            print(f"[finalize] borrow 1 from {d} -> {best_s}")
+                        peel_ok = is_peelable(v, lab_v)
+                        conn_ok = False
+                        if not peel_ok and conn_checks < MAX_CONNECTIVITY_CHECKS:
+                            conn_ok = connected_after_removal_fast(v, lab_v)
+                            conn_checks += 1
+                        if not (peel_ok or conn_ok):
+                            continue
+                        # Relabel v -> sid
+                        assigned[v] = sid
+                        remain[sid] -= 1
+                        remain[lab_v] += 1
+                        size_by[sid] += 1
+                        size_by[lab_v] -= 1
+                        region_tiles[sid].add(v)
+                        if v in region_tiles[lab_v]:
+                            region_tiles[lab_v].remove(v)
+                        # Add v's unassigned neighbors to sid frontier
+                        for w in neighbors[v]:
+                            if assigned[w] == -1:
+                                push_frontier_for(sid, w)
+                        # Try to immediately expand donor to make net progress
+                        if remain[lab_v] > 0:
+                            u2 = expand_one(lab_v)
+                            if u2 is None:
+                                rebuild_frontier_for(lab_v)
+                                u2 = expand_one(lab_v)
+                            if u2 is not None:
+                                progressed_assign = True
+                        else:
+                            progressed_assign = True
+                        rescued = True
                         break
-            assigned[idx] = best_s
-            budgets[best_s] -= 1
-            if debug:
-                cx, cy = centers[idx]
-                print(f"    -> finalize {best_s} idx={idx} sup={best_sup} at ({float(cx):.3f}, {float(cy):.3f}) rem={budgets[best_s]}")
-            # Update supports for best_s neighbors (keeps later decisions cohesive)
-            for w in adj.get(idx, []):
-                if w not in comp_set or w in assigned:
-                    continue
-                old = support_counts[best_s].get(w, 0)
-                new = old + 1
-                support_counts[best_s][w] = new
-                if 0 <= old <= 6:
-                    candidate_buckets[best_s][old].discard(w)
-                if 0 <= new <= 6:
-                    candidate_buckets[best_s][new].add(w)
+                    if rescued:
+                        break
+            if not rescued:
+                log_progress(force=True, note="rescue stalled")
+                raise RuntimeError("Rescue failed: no peelable boundary found to satisfy remaining quotas.")
 
-    return assigned
+        cur_remaining_total = int(remain.sum())
+        if progressed_assign or cur_remaining_total < prev_remaining_total:
+            stall_loops = 0
+        else:
+            stall_loops += 1
+
+        if DEBUG:
+            log_progress(force=not progressed_assign, note=("no-progress" if not progressed_assign else ""))
+
+        if stall_loops > MAX_STALL_LOOPS:
+            for sid in range(S):
+                if remain[sid] > 0:
+                    rebuild_frontier_for(sid)
+            log_progress(force=True, note="rebuilt all frontiers")
+            stall_loops = 0
+
+        prev_remaining_total = cur_remaining_total
+
+    # Map back to globals and names
+    out: Dict[int, str] = {}
+    for li in range(n):
+        sid = int(assigned[li])
+        if sid >= 0:
+            out[int(gl_idx[li])] = series_names[sid]
+    return out
 
 
 # -----------------------------
@@ -600,51 +575,58 @@ def main():
     idx_all = np.arange(len(centers), dtype=np.int64)
     idx_continent = idx_all[land_mask & want_cont]
     if len(idx_continent) == 0:
-        raise RuntimeError(f"No tiles found for continent='{CONTINENT}'.")
+        raise RuntimeError(f"No tiles found for continent={CONTINENT!r}.")
 
-    # Build a robust neighbor graph using file orientation
+    # Neighbor graph restricted to continent tiles
     adj = build_neighbor_graph(idx_continent, centers, radius, orientation, tol_factor=1e-3, debug=DEBUG)
 
+    # Connected components (islands)
     comps = connected_components(idx_continent.tolist(), adj)
     comps = [c for c in comps if c]
     comp_sizes = [len(c) for c in comps]
+    if DEBUG:
+        print(f"[info] continent components: {len(comps)} sizes={comp_sizes[:10]}{'...' if len(comp_sizes)>10 else ''}")
 
+    # Apportion global counts to components
     total_tiles = int(sum(comp_sizes))
     global_counts = largest_remainder_apportion(DISTRIBUTION, total_tiles)
     per_comp_counts = split_counts_across_components(global_counts, comp_sizes)
 
+    # Assign per component via physics-like contiguous growth
     assigned_series: Dict[int, str] = {}
-    series_names = list(DISTRIBUTION.keys())
-
     for ci, (comp_indices, local_counts) in enumerate(zip(comps, per_comp_counts)):
+        # filter out zero entries and skip empty work
+        local_counts = {s: c for s, c in local_counts.items() if c > 0}
         if sum(local_counts.values()) == 0:
             continue
         if DEBUG:
-            print(f"\n[comp {ci}] size={len(comp_indices)} local_counts={local_counts}")
-        local_assigned = region_grow_component(
+            print(f"[comp {ci}] size={len(comp_indices)} series={len(local_counts)}")
+        # create a component-local RNG seeded from the global RNG to keep reproducibility
+        comp_seed = rng.randrange(0, 2**32)
+        comp_rng = random.Random(comp_seed)
+        local_assigned = physics_growth_assign(
             comp_indices=comp_indices,
             adj=adj,
-            series_names=series_names,
-            local_counts=local_counts,
             centers=centers,
-            rng=rng,
-            debug=DEBUG,
+            local_counts=local_counts,
+            rng=comp_rng,
         )
         assigned_series.update(local_assigned)
 
-    # Ensure all continent tiles are assigned (fallback to largest series if not)
-    unassigned = [i for i in idx_continent if i not in assigned_series]
+    # Sanity: ensure all continent tiles are assigned (should be)
+    unassigned = [int(i) for i in idx_continent if int(i) not in assigned_series]
     if unassigned:
+        # Assign leftovers to largest global series
         largest = max(global_counts.items(), key=lambda kv: kv[1])[0]
         for i in unassigned:
             assigned_series[i] = largest
         if DEBUG:
             print(f"[post] unassigned tiles: {len(unassigned)} -> assigned to '{largest}'")
 
-    # Prepare subset centers and labels for HXF output
+    # Prepare output subset and labels (preserve original ordering of idx_continent)
     centers_out = centers[idx_continent]
     series_per_idx = [assigned_series[int(i)] for i in idx_continent]
-    class_is_land_out = np.ones(len(idx_continent), dtype=bool)  # all land in this subset
+    class_is_land_out = np.ones(len(idx_continent), dtype=bool)
 
     OUTPUT_HXF.parent.mkdir(parents=True, exist_ok=True)
     write_hxf(
@@ -669,4 +651,7 @@ def main():
 
 
 if __name__ == "__main__":
+    startMs = time.time()
     main()
+    diff = time.time() - startMs
+    print(f"\nDone. Elapsed time: {diff:.1f} seconds")
