@@ -29,8 +29,9 @@ Installation
    - Windows (PowerShell):
      - `python -m venv .venv`
      - `.venv\Scripts\Activate.ps1`
-2. Install requirements (adjust as project provides `requirements.txt`):
-   - `pip install numpy geopandas` `shapely` `requests` `matplotlib`
+2. Install requirements
+   - `pip install --upgrade pip`
+   - `pip install -r requirements.txt`
 
 Typical workflow
 1. Generate hex grid (produces `outputs/world_hexes_equal_earth.hxf`):
