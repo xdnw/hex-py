@@ -70,3 +70,13 @@ Troubleshooting
 - If `read_hxf` / `write_hxf` import fails, ensure the `hxf_io` helper module is on `PYTHONPATH`.
 - If no tiles are found for a continent, verify the input HXF (`HXF_PATH`) has `continent_labels` / `continent_codes` metadata.
 - For missing system GIS dependencies, inspect `generate_hexes.py` and install required packages (`geopandas`, `shapely`, `pyproj`) as needed.
+
+### Distribution visualizations
+
+- Continent distribution (per-continent series share):
+
+![Continent distribution](example/continent_dist.png)
+
+- Global distribution (target vs actual):
+
+![World distribution](example/world_dist.png)

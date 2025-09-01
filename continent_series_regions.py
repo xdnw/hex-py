@@ -25,19 +25,19 @@ BLOBINESS = 1
 
 # Target global distribution (weights, not necessarily integers)
 DISTRIBUTION = {
-    "Eclipse": 13.2,
-    "The Syndicate": 12.5,
-    "Grumpy Old Bastards": 11.5,
-    "Rose": 8.9,
-    "Guardian": 7.1,
-    "Event Horizon": 6.5,
-    "The Knights Radiant": 4.5,
-    "Yarr": 4.5,
-    "Singularity": 4.3,
-    "Citadel": 3.4,
-    "The Fighting Pacifists": 2.9,
-    "Myrmidons": 1.4,
-    "The Immortals": 1.4,
+    "Rose": 13.2,
+    "Marigold": 12.5,
+    "Aster": 11.5,
+    "Peony": 8.9,
+    "Camellia": 7.1,
+    "Iris": 6.5,
+    "Lily": 4.5,
+    "Orchid": 4.5,
+    "Sunflower": 4.3,
+    "Lotus": 3.4,
+    "Poppy": 2.9,
+    "Violet": 1.4,
+    "Magnolia": 1.4,
 }
 
 # Physics growth parameters
